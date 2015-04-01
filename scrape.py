@@ -12,12 +12,17 @@ from copy import deepcopy
 
 PITCHFORK_ARTIST_URL_PAT = re.compile('^.*pitchfork.com/artists/(?P<pitchfork_slug>(?P<pitchfork_id>\d+)-[^\/]+)')
 config = {
-  'threads': 2,
+  'threads': 15,
   'cache_policy': 'http',
   'data_path': 'data'
 }
 
-db = dataset.connect('sqlite:///data/pitchfork_scrape.sqlite')
+SQLITE_URL = 'sqlite:///{}'.format(os.path.join(config['data_path'],'pitchfork_scrape.sqlite'))
+import os
+try:
+    os.makedirs(config['data_path'])
+except OSError: pass
+db = dataset.connect(SQLITE_URL)
 
 scraper = scrapekit.Scraper('pitchfork-artists', config=config)
 UNFAMILIAR = defaultdict(list)
@@ -31,7 +36,7 @@ def artist_indexes():
         yield u'http://pitchfork.com/artists/by/{}/'.format(letter)
 
 @scraper.task
-def extract_artists_from_index(url):
+def index_artists(url):
     doc = scraper.get(url).html()
     div_ary = doc.xpath(CSSSelector('#artist-list').path)
     if len(div_ary) == 0:
@@ -46,11 +51,8 @@ def extract_artists_from_index(url):
     next_link_ary = doc.xpath(CSSSelector('#main .pagination .next').path)
     if next_link_ary:
         next_url = urljoin(url,next_link_ary[0].attrib['href'])
-        for artist_url in extract_artists_from_index(next_url):
+        for artist_url in index_artists(next_url):
             yield artist_url
-
-def fallback_elaborator(base_url, kind,container):
-    return []
 
 def reviews_and_tracks(base_url, kind, container):
     coverage = []
@@ -101,6 +103,7 @@ def make_group_dict(doc):
 
 @scraper.task
 def extract_artist_data(item_url):
+    print item_url
     #eg http://pitchfork.com/artists/30707-todolo/
     match = PITCHFORK_ARTIST_URL_PAT.match(item_url)
     d = match.groupdict()
@@ -116,21 +119,22 @@ def extract_artist_data(item_url):
     group_dict = make_group_dict(doc)
     for kind,group in group_dict.items():
         try:
-            elaborator = COVERAGE_PROCESSORS[kind]
+            processor = COVERAGE_PROCESSORS[kind]
+            this_cvrg = processor(item_url, kind, group)
+            coverage.extend(this_cvrg)
         except KeyError:
             if kind not in UNFAMILIAR:
                 scraper.log.warning(u"Unfamiliar coverage type {}".format(kind))
             UNFAMILIAR[kind].append(item_url)
-            elaborator = fallback_elaborator
 
-        this_cvrg = elaborator(item_url, kind, group)
-        coverage.extend(this_cvrg)
         d['coverage_types'][kind] = len(this_cvrg)
+    print d['pitchfork_slug']
     return d
 
 @scraper.task
-def save_to_db(d):
-    d = deepcopy(d)
+def save_to_db(data):
+    print "save to DB"
+    d = deepcopy(data)
     artist_table = db['artist']
     coverage = d.pop('coverage')
     types = d.pop('coverage_types')
@@ -144,10 +148,11 @@ def save_to_db(d):
         c['artist_id'] = d['pitchfork_id']
         cov_table.insert(c)
 
+    return data # unchanged original
 
 
 @scraper.task
-def save_artist_data(d):
+def write_artist_json(d):
     try:
         fn = os.path.join(config['data_path'],u'{pitchfork_slug}.json'.format(**d))
         with open(fn,'wb') as f:
@@ -156,7 +161,7 @@ def save_artist_data(d):
         scraper.log.error(e)
 
 def main():
-    pipeline = artist_indexes | extract_artists_from_index | extract_artist_data | save_to_db > write_artist_json
+    pipeline = artist_indexes | index_artists | extract_artist_data > save_to_db # > write_artist_json
     pipeline.run()
     print
     pprint(UNFAMILIAR)
